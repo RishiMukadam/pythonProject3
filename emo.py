@@ -1,21 +1,19 @@
-# Optimized emo.py for Business Analytics
 import os
 os.environ["TRANSFORMERS_NO_TF"] = "1"
 
 import streamlit as st
 import pandas as pd
+import base64
+from io import BytesIO
+from fpdf import FPDF
 import nltk
 from nltk.sentiment import SentimentIntensityAnalyzer
-from nltk.tokenize import word_tokenize
-from nltk.corpus import opinion_lexicon
 from transformers import pipeline
 
-# Ensure NLTK data is downloaded
-nltk.download("punkt")
+# NLTK downloads
 nltk.download("vader_lexicon")
-nltk.download("opinion_lexicon")
 
-# Cache model loading
+# Load models once
 @st.cache_resource
 def get_bert_pipeline():
     return pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
@@ -24,64 +22,88 @@ def get_bert_pipeline():
 def get_emotion_pipeline():
     return pipeline("text-classification", model="j-hartmann/emotion-english-distilroberta-base", return_all_scores=True)
 
-# Sentiment analysis
-def analyze_sentiment_vader(text):
-    sia = SentimentIntensityAnalyzer()
-    score = sia.polarity_scores(text)['compound']
-    if score >= 0.2:
-        return "Positive"
-    elif score <= -0.2:
-        return "Negative"
-    else:
-        return "Neutral"
+# Analyze with VADER
+def analyze_vader(text):
+    score = SentimentIntensityAnalyzer().polarity_scores(text)['compound']
+    return "Positive" if score > 0.2 else "Negative" if score < -0.2 else "Neutral"
 
-def analyze_sentiment_bert(text, pipe):
-    result = pipe(text[:512])[0]
-    return "Positive" if result['label'] == 'LABEL_1' else "Negative"
+# Analyze with BERT
+def analyze_bert(text):
+    result = get_bert_pipeline()(text[:512])[0]
+    return result['label'], result['score']
 
-def detect_emotion(text, pipe):
-    results = pipe(text[:512])[0]
-    top = max(results, key=lambda x: x['score'])
-    return top['label'], top['score']
+# Analyze Emotion
+def detect_emotion(text):
+    result = get_emotion_pipeline()(text[:512])[0]
+    top_result = max(result, key=lambda x: x['score'])
+    return top_result['label'], top_result['score']
 
-def process_text(text, bert_pipe, emotion_pipe):
-    vader = analyze_sentiment_vader(text)
-    bert = analyze_sentiment_bert(text, bert_pipe)
-    emotion, confidence = detect_emotion(text, emotion_pipe)
-    return vader, bert, emotion, confidence
+# CSV download link
+def generate_csv(data):
+    csv = pd.DataFrame(data).to_csv(index=False)
+    b64 = base64.b64encode(csv.encode()).decode()
+    return f'<a href="data:file/csv;base64,{b64}" download="sentiment_analysis.csv">Download Results as CSV</a>'
 
 def main():
-    st.set_page_config("Sentiment & Emotion Analyzer - Business")
-    st.title("📊 Business Feedback Analyzer")
+    st.set_page_config(page_title="Customer Sentiment Analyzer", layout="wide")
+    st.title("Customer Sentiment Analyzer")
 
-    st.markdown("""
-    Upload a CSV file containing customer feedback (column name must include 'text').
-    The app will analyze sentiment and emotion for each entry.
-    """)
+    # Upload
+    uploaded_file = st.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx"])
 
-    uploaded_file = st.file_uploader("📂 Upload CSV", type=["csv"])
-
+    data_rows = []
     if uploaded_file:
-        df = pd.read_csv(uploaded_file)
-        text_columns = [col for col in df.columns if 'text' in col.lower()]
-        if not text_columns:
-            st.error("No column with 'text' found.")
-            return
+        try:
+            if uploaded_file.name.endswith(".csv"):
+                df = pd.read_csv(uploaded_file)
+            else:
+                df = pd.read_excel(uploaded_file)
 
-        text_col = text_columns[0]
-        st.success(f"Analyzing column: {text_col}")
+            selected_col = st.selectbox("Select column to analyze", df.columns)
+            row_limit = st.slider("Number of rows to analyze", 1, min(len(df), 1000), len(df))
+            data_rows = df[selected_col].dropna().astype(str).tolist()[:row_limit]
 
-        bert_pipe = get_bert_pipeline()
-        emotion_pipe = get_emotion_pipeline()
+        except Exception as e:
+            st.error(f"Error reading file: {e}")
 
-        df['VADER_Sentiment'] = df[text_col].astype(str).apply(analyze_sentiment_vader)
-        df['BERT_Sentiment'] = df[text_col].astype(str).apply(lambda x: analyze_sentiment_bert(x, bert_pipe))
-        df['Emotion'], df['Confidence'] = zip(*df[text_col].astype(str).apply(lambda x: detect_emotion(x, emotion_pipe)))
+    # Analyze button
+    if st.button("Analyze") and data_rows:
+        st.info(f"Analyzing {len(data_rows)} entries...")
+        results = []
+        progress = st.progress(0)
 
-        st.dataframe(df.head())
+        for i, text in enumerate(data_rows):
+            try:
+                vader = analyze_vader(text)
+                bert_label, bert_score = analyze_bert(text)
+                emotion, emo_score = detect_emotion(text)
 
-        csv = df.to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Download Results as CSV", csv, "analyzed_results.csv", "text/csv")
+                results.append({
+                    "Text": text[:100],
+                    "VADER": vader,
+                    "BERT Sentiment": bert_label,
+                    "BERT Confidence": f"{bert_score:.2%}",
+                    "Top Emotion": emotion,
+                    "Emotion Confidence": f"{emo_score:.2%}"
+                })
+
+            except Exception as e:
+                results.append({
+                    "Text": text[:100],
+                    "Error": str(e)
+                })
+
+            progress.progress((i + 1) / len(data_rows))
+
+        # Show results
+        result_df = pd.DataFrame(results)
+        st.dataframe(result_df)
+        st.markdown(generate_csv(results), unsafe_allow_html=True)
+
+    # Clear Button
+    if st.button("Clear"):
+        st.session_state.clear()
+        st.rerun()
 
 if __name__ == "__main__":
     main()
